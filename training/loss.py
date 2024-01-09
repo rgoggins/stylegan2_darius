@@ -10,6 +10,7 @@ import numpy as np
 import tensorflow as tf
 import dnnlib.tflib as tflib
 from dnnlib.tflib.autosummary import autosummary
+import lpips
 
 #----------------------------------------------------------------------------
 # Logistic loss from the paper
@@ -90,6 +91,7 @@ def D_logistic_r2(G, D, opt, training_set, minibatch_size, reals, labels, gamma=
 # "Wasserstein Generative Adversarial Networks", Arjovsky et al. 2017
 
 def G_wgan(G, D, opt, training_set, minibatch_size):
+    # modified wgan to compute the
     _ = opt
     latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
     labels = training_set.get_random_labels_tf(minibatch_size)
@@ -111,6 +113,28 @@ def D_wgan(G, D, opt, training_set, minibatch_size, reals, labels, wgan_epsilon=
         epsilon_penalty = autosummary('Loss/epsilon_penalty', tf.square(real_scores_out))
         loss += epsilon_penalty * wgan_epsilon
     return loss, None
+
+#----------------------------------------------------------------------------
+# LPIPs loss from the paper
+# "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric", Zhang et al. 2018
+
+def G_lpips(G, training_set, down_sampled_set):
+    # training set here is TFRecordDataset
+    loss_fn_vgg = lpips.LPIPS(net='vgg')
+    images_upscaled_by_generator = G.get_output_for(down_sampled_set, is_training=True)
+    # TODO: sanity check if images are normalized to [-1,1]
+    return loss_fn_vgg(training_set, images_upscaled_by_generator), None
+
+#----------------------------------------------------------------------------
+# Training for Nex Art Upscaler
+#   Note: weighting taken from Table A2 from Giga-GAN paper
+
+def G_nex_loss(G, D, opt, training_set, minibatch_size):
+    return 100.0 * G_lpips(G, training_set) + G_wgan(G, D, opt, training_set, minibatch_size), None
+
+def D_nex_loss(G, D, opt, training_set, minibatch_size, reals, labels, wgan_epsilon=0.001):
+    return D_wgan(G, D, opt, training_set, minibatch_size, reals, labels, wgan_epsilon=0.001), None
+
 
 #----------------------------------------------------------------------------
 # WGAN-GP loss from the paper

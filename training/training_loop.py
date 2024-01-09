@@ -41,6 +41,12 @@ def process_reals(x, labels, lod, mirror_augment, drange_data, drange_net):
         x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
     return x, labels
 
+def generate_downsampled_reals(x):
+    # x is of dim [mb, h, w, c]
+    h_old, w_old = x.shape[1], x.shape[2]
+    x = tf.image.resize(x, [h_old // 2, w_old // 2], method='bilinear')
+    return x
+
 #----------------------------------------------------------------------------
 # Evaluate time-varying training parameters.
 
@@ -202,7 +208,11 @@ def training_loop(
                 sched = training_schedule(cur_nimg=int(resume_kimg*1000), training_set=training_set, **sched_args)
                 reals_var = tf.Variable(name='reals', trainable=False, initial_value=tf.zeros([sched.minibatch_gpu] + training_set.shape))
                 labels_var = tf.Variable(name='labels', trainable=False, initial_value=tf.zeros([sched.minibatch_gpu, training_set.label_size]))
+                
                 reals_write, labels_write = training_set.get_minibatch_tf()
+                # reals_write are the real images, we lower their resolution here, then pass lowered res into both
+                # disc and gen losses
+                down_sampled_images = generate_downsampled_reals(reals_write)
                 reals_write, labels_write = process_reals(reals_write, labels_write, lod_in, mirror_augment, training_set.dynamic_range, drange_net)
                 reals_write = tf.concat([reals_write, reals_var[minibatch_gpu_in:]], axis=0)
                 labels_write = tf.concat([labels_write, labels_var[minibatch_gpu_in:]], axis=0)
@@ -216,6 +226,7 @@ def training_loop(
             if 'lod' in G_gpu.vars: lod_assign_ops += [tf.assign(G_gpu.vars['lod'], lod_in)]
             if 'lod' in D_gpu.vars: lod_assign_ops += [tf.assign(D_gpu.vars['lod'], lod_in)]
             with tf.control_dependencies(lod_assign_ops):
+                # Need to modify our generator and discriminator loss inputs
                 with tf.name_scope('G_loss'):
                     G_loss, G_reg = dnnlib.util.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_gpu_in, **G_loss_args)
                 with tf.name_scope('D_loss'):

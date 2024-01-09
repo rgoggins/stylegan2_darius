@@ -86,7 +86,7 @@ def naive_downsample_2d(x, factor=2):
 #----------------------------------------------------------------------------
 # Modulated convolution layer.
 
-def modulated_conv2d_layer(x, y, fmaps, kernel, up=False, down=False, demodulate=True, resample_kernel=None, gain=1, use_wscale=True, lrmul=1, fused_modconv=True, weight_var='weight', mod_weight_var='mod_weight', mod_bias_var='mod_bias'):
+def modulated_conv2d_layer(x, fmaps, kernel, up=False, down=False, demodulate=True, resample_kernel=None, gain=1, use_wscale=True, lrmul=1, fused_modconv=True, weight_var='weight', mod_weight_var='mod_weight', mod_bias_var='mod_bias'):
     assert not (up and down)
     assert kernel >= 1 and kernel % 2 == 1
 
@@ -95,13 +95,17 @@ def modulated_conv2d_layer(x, y, fmaps, kernel, up=False, down=False, demodulate
     ww = w[np.newaxis] # [BkkIO] Introduce minibatch dimension.
 
     # Modulate.
-    s = dense_layer(y, fmaps=x.shape[1].value, weight_var=mod_weight_var) # [BI] Transform incoming W to style.
-    s = apply_bias_act(s, bias_var=mod_bias_var) + 1 # [BI] Add bias (initially 1).
-    ww *= tf.cast(s[:, np.newaxis, np.newaxis, :, np.newaxis], w.dtype) # [BkkIO] Scale input feature maps.
+    # No need to modulate, we aren't taking in any latent vector anymore.
+    # s = dense_layer(y, fmaps=x.shape[1].value, weight_var=mod_weight_var) # [BI] Transform incoming W to style.
+    # s = apply_bias_act(s, bias_var=mod_bias_var) + 1 # [BI] Add bias (initially 1).
+    # ww *= tf.cast(s[:, np.newaxis, np.newaxis, :, np.newaxis], w.dtype) # [BkkIO] Scale input feature maps.
 
     # Demodulate.
+    # probably no harm in normalizing the weights before applying convolution
+
     if demodulate:
         d = tf.rsqrt(tf.reduce_sum(tf.square(ww), axis=[1,2,3]) + 1e-8) # [BO] Scaling factor.
+        # per-output feature map standard deviation
         ww *= d[:, np.newaxis, np.newaxis, np.newaxis, :] # [BkkIO] Scale output feature maps.
 
     # Reshape/scale input.
@@ -149,7 +153,7 @@ def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
 # Used in configs B-F (Table 1).
 
 def G_main(
-    latents_in,                                         # First input: Latent vectors (Z) [minibatch, latent_size].
+    images_in,                                          # First input: Images [minibatch, channel, height, width].
     labels_in,                                          # Second input: Conditioning labels [minibatch, label_size].
     truncation_psi          = 0.5,                      # Style strength multiplier for the truncation trick. None = disable.
     truncation_cutoff       = None,                     # Number of layers for which to apply the truncation trick. None = disable.
@@ -169,6 +173,7 @@ def G_main(
     # Validate arguments.
     assert not is_training or not is_validation
     assert isinstance(components, dnnlib.EasyDict)
+    assert not return_dlatents
     if is_validation:
         truncation_psi = truncation_psi_val
         truncation_cutoff = truncation_cutoff_val
@@ -184,63 +189,65 @@ def G_main(
     # Setup components.
     if 'synthesis' not in components:
         components.synthesis = tflib.Network('G_synthesis', func_name=globals()[synthesis_func], **kwargs)
-    num_layers = components.synthesis.input_shape[1]
-    dlatent_size = components.synthesis.input_shape[2]
-    if 'mapping' not in components:
-        components.mapping = tflib.Network('G_mapping', func_name=globals()[mapping_func], dlatent_broadcast=num_layers, **kwargs)
+    # num_layers = components.synthesis.input_shape[1]
+    # dlatent_size = components.synthesis.input_shape[2]
+    # if 'mapping' not in components:
+    #     components.mapping = tflib.Network('G_mapping', func_name=globals()[mapping_func], dlatent_broadcast=num_layers, **kwargs)
 
-    # Setup variables.
+    # Setup level of detail.
     lod_in = tf.get_variable('lod', initializer=np.float32(0), trainable=False)
-    dlatent_avg = tf.get_variable('dlatent_avg', shape=[dlatent_size], initializer=tf.initializers.zeros(), trainable=False)
+
+    # Leave these commented out for when we want to switch to conditional superres
+
+    # dlatent_avg = tf.get_variable('dlatent_avg', shape=[dlatent_size], initializer=tf.initializers.zeros(), trainable=False)
 
     # Evaluate mapping network.
-    dlatents = components.mapping.get_output_for(latents_in, labels_in, is_training=is_training, **kwargs)
-    dlatents = tf.cast(dlatents, tf.float32)
+    # dlatents = components.mapping.get_output_for(latents_in, labels_in, is_training=is_training, **kwargs)
+    # images_in = tf.cast(images_in, tf.float32)
 
-    # Update moving average of W.
-    if dlatent_avg_beta is not None:
-        with tf.variable_scope('DlatentAvg'):
-            batch_avg = tf.reduce_mean(dlatents[:, 0], axis=0)
-            update_op = tf.assign(dlatent_avg, tflib.lerp(batch_avg, dlatent_avg, dlatent_avg_beta))
-            with tf.control_dependencies([update_op]):
-                dlatents = tf.identity(dlatents)
+    # # Update moving average of W.
+    # if dlatent_avg_beta is not None:
+    #     with tf.variable_scope('DlatentAvg'):
+    #         batch_avg = tf.reduce_mean(dlatents[:, 0], axis=0)
+    #         update_op = tf.assign(dlatent_avg, tflib.lerp(batch_avg, dlatent_avg, dlatent_avg_beta))
+    #         with tf.control_dependencies([update_op]):
+    #             dlatents = tf.identity(dlatents)
 
-    # Perform style mixing regularization.
-    if style_mixing_prob is not None:
-        with tf.variable_scope('StyleMix'):
-            latents2 = tf.random_normal(tf.shape(latents_in))
-            dlatents2 = components.mapping.get_output_for(latents2, labels_in, is_training=is_training, **kwargs)
-            dlatents2 = tf.cast(dlatents2, tf.float32)
-            layer_idx = np.arange(num_layers)[np.newaxis, :, np.newaxis]
-            cur_layers = num_layers - tf.cast(lod_in, tf.int32) * 2
-            mixing_cutoff = tf.cond(
-                tf.random_uniform([], 0.0, 1.0) < style_mixing_prob,
-                lambda: tf.random_uniform([], 1, cur_layers, dtype=tf.int32),
-                lambda: cur_layers)
-            dlatents = tf.where(tf.broadcast_to(layer_idx < mixing_cutoff, tf.shape(dlatents)), dlatents, dlatents2)
+    # # Perform style mixing regularization.
+    # if style_mixing_prob is not None:
+    #     # might not want to do mixing regularization, it doesn't perform as well in the paper as without
+    #     with tf.variable_scope('StyleMix'):
+    #         latents2 = tf.random_normal(tf.shape(latents_in))
+    #         dlatents2 = components.mapping.get_output_for(latents2, labels_in, is_training=is_training, **kwargs)
+    #         dlatents2 = tf.cast(dlatents2, tf.float32)
+    #         layer_idx = np.arange(num_layers)[np.newaxis, :, np.newaxis]
+    #         cur_layers = num_layers - tf.cast(lod_in, tf.int32) * 2
+    #         mixing_cutoff = tf.cond(
+    #             tf.random_uniform([], 0.0, 1.0) < style_mixing_prob,
+    #             lambda: tf.random_uniform([], 1, cur_layers, dtype=tf.int32),
+    #             lambda: cur_layers)
+    #         dlatents = tf.where(tf.broadcast_to(layer_idx < mixing_cutoff, tf.shape(dlatents)), dlatents, dlatents2)
 
-    # Apply truncation trick.
-    if truncation_psi is not None:
-        with tf.variable_scope('Truncation'):
-            layer_idx = np.arange(num_layers)[np.newaxis, :, np.newaxis]
-            layer_psi = np.ones(layer_idx.shape, dtype=np.float32)
-            if truncation_cutoff is None:
-                layer_psi *= truncation_psi
-            else:
-                layer_psi = tf.where(layer_idx < truncation_cutoff, layer_psi * truncation_psi, layer_psi)
-            dlatents = tflib.lerp(dlatent_avg, dlatents, layer_psi)
+    # # Apply truncation trick.
+    # if truncation_psi is not None:
+    #     with tf.variable_scope('Truncation'):
+    #         layer_idx = np.arange(num_layers)[np.newaxis, :, np.newaxis]
+    #         layer_psi = np.ones(layer_idx.shape, dtype=np.float32)
+    #         if truncation_cutoff is None:
+    #             layer_psi *= truncation_psi
+    #         else:
+    #             layer_psi = tf.where(layer_idx < truncation_cutoff, layer_psi * truncation_psi, layer_psi)
+    #         dlatents = tflib.lerp(dlatent_avg, dlatents, layer_psi)
 
     # Evaluate synthesis network.
     deps = []
     if 'lod' in components.synthesis.vars:
         deps.append(tf.assign(components.synthesis.vars['lod'], lod_in))
     with tf.control_dependencies(deps):
-        images_out = components.synthesis.get_output_for(dlatents, is_training=is_training, force_clean_graph=is_template_graph, **kwargs)
+        images_out = components.synthesis.get_output_for(images_in, is_training=is_training, force_clean_graph=is_template_graph, **kwargs)
 
     # Return requested outputs.
     images_out = tf.identity(images_out, name='images_out')
-    if return_dlatents:
-        return images_out, dlatents
     return images_out
 
 #----------------------------------------------------------------------------
@@ -415,8 +422,7 @@ def G_synthesis_stylegan_revised(
 # Used in configs E-F (Table 1).
 
 def G_synthesis_stylegan2(
-    dlatents_in,                        # Input: Disentangled latents (W) [minibatch, num_layers, dlatent_size].
-    dlatent_size        = 512,          # Disentangled latent (W) dimensionality.
+    images_in,                          # First input: Images [minibatch, channel, height, width].
     num_channels        = 3,            # Number of output color channels.
     resolution          = 1024,         # Output resolution.
     fmap_base           = 16 << 10,     # Overall multiplier for the number of feature maps.
@@ -433,6 +439,7 @@ def G_synthesis_stylegan2(
 
     resolution_log2 = int(np.log2(resolution))
     assert resolution == 2**resolution_log2 and resolution >= 4
+    # nf here is the number of feature maps I think
     def nf(stage): return np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
     assert architecture in ['orig', 'skip', 'resnet']
     act = nonlinearity
@@ -440,8 +447,8 @@ def G_synthesis_stylegan2(
     images_out = None
 
     # Primary inputs.
-    dlatents_in.set_shape([None, num_layers, dlatent_size])
-    dlatents_in = tf.cast(dlatents_in, dtype)
+    # dlatents_in.set_shape([None, num_layers, dlatent_size])
+    images_in = tf.cast(images_in, dtype)
 
     # Noise inputs.
     noise_inputs = []
@@ -452,7 +459,7 @@ def G_synthesis_stylegan2(
 
     # Single convolution layer with all the bells and whistles.
     def layer(x, layer_idx, fmaps, kernel, up=False):
-        x = modulated_conv2d_layer(x, dlatents_in[:, layer_idx], fmaps=fmaps, kernel=kernel, up=up, resample_kernel=resample_kernel, fused_modconv=fused_modconv)
+        x = modulated_conv2d_layer(x, fmaps=fmaps, kernel=kernel, up=up, resample_kernel=resample_kernel, fused_modconv=fused_modconv)
         if randomize_noise:
             noise = tf.random_normal([tf.shape(x)[0], 1, x.shape[2], x.shape[3]], dtype=x.dtype)
         else:
@@ -478,7 +485,7 @@ def G_synthesis_stylegan2(
             return upsample_2d(y, k=resample_kernel)
     def torgb(x, y, res): # res = 2..resolution_log2
         with tf.variable_scope('ToRGB'):
-            t = apply_bias_act(modulated_conv2d_layer(x, dlatents_in[:, res*2-3], fmaps=num_channels, kernel=1, demodulate=False, fused_modconv=fused_modconv))
+            t = apply_bias_act(modulated_conv2d_layer(x, fmaps=num_channels, kernel=1, demodulate=False, fused_modconv=fused_modconv))
             return t if y is None else y + t
 
     # Early layers.
@@ -486,7 +493,8 @@ def G_synthesis_stylegan2(
     with tf.variable_scope('4x4'):
         with tf.variable_scope('Const'):
             x = tf.get_variable('const', shape=[1, nf(1), 4, 4], initializer=tf.initializers.random_normal())
-            x = tf.tile(tf.cast(x, dtype), [tf.shape(dlatents_in)[0], 1, 1, 1])
+            x = tf.tile(tf.cast(x, dtype), [tf.shape(images_in)[0], 1, 1, 1])
+            # replace with minibatch size of images in, should be the same
         with tf.variable_scope('Conv'):
             x = layer(x, layer_idx=0, fmaps=nf(1), kernel=3)
         if architecture == 'skip':
